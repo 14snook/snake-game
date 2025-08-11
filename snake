@@ -1,0 +1,330 @@
+<!--
+Website package: index.html
+
+Deployment instructions (quick):
+1) GitHub Pages (free):
+   - Create a new repository (e.g., snake-1440p-site).
+   - Add this file as index.html in the repository root and commit.
+   - In repo Settings > Pages, select branch 'main' (or 'gh-pages') and root. Save.
+   - Your site will be available at https://<your-username>.github.io/<repo-name>/ (or at your username.github.io if repo named username.github.io).
+
+2) Netlify (drag-and-drop):
+   - Go to netlify.com, sign up, and drag-and-drop this index.html onto Sites → Deploy.
+   - Or use Connect to GitHub for continuous deploys.
+
+3) Simple static hosting (any):
+   - Upload index.html to your static host (VPS, S3, Firebase Hosting, Surge, Vercel static, etc.).
+
+Notes:
+- This single-file site uses Pyodide from CDN; it requires an internet connection to load Pyodide.
+- For offline/self-hosted Pyodide, you'd need to host the Pyodide distribution files on your server.
+
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Snake — 1440p Fullscreen (Pyodide)</title>
+  <meta name="description" content="Smooth, modern Snake running at a 2560×1440 logical resolution using Pyodide (Python in the browser)."> 
+  <style>
+    html,body{height:100%;margin:0;background:#0b1020;display:flex;align-items:center;justify-content:center}
+    #canvas{display:block;background:linear-gradient(180deg,#071022,#0b1020);box-shadow:0 10px 40px rgba(0,0,0,0.6);}
+    #ui{position:fixed;left:12px;top:12px;color:#cfe8ff;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;background:rgba(0,0,0,0.25);padding:8px 10px;border-radius:10px;backdrop-filter: blur(6px);z-index:20}
+    button{margin-left:8px;padding:6px 10px;border-radius:8px;border:0;background:#1b2a4a;color:#fff;cursor:pointer}
+    a{color:#9bdcff}
+    footer{position:fixed;right:12px;bottom:12px;color:#9fb9d9;font-family:system-ui;z-index:20}
+  </style>
+</head>
+<body>
+  <div id="ui">Snake — 1440p Fullscreen (Pyodide) <button id="fs">Toggle Fullscreen</button> <button id="restart">Restart</button></div>
+  <canvas id="canvas" width="2560" height="1440"></canvas>
+  <footer>Controls: Arrow keys / WASD • Touch supported</footer>
+
+  <!-- Pyodide loader (CDN) -->
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js"></script>
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const FS_BTN = document.getElementById('fs');
+    const RESTART_BTN = document.getElementById('restart');
+
+    // Make canvas pixel-perfect for 2560x1440 fullscreen
+    function fitFullscreen() {
+      const scaleX = window.innerWidth / 2560;
+      const scaleY = window.innerHeight / 1440;
+      const scale = Math.min(scaleX, scaleY);
+      const w = Math.round(2560 * scale);
+      const h = Math.round(1440 * scale);
+      canvas.style.width = w + 'px';
+      canvas.style.height = h + 'px';
+      canvas.style.imageRendering = 'auto';
+      // center canvas
+      canvas.style.margin = '0 auto';
+      canvas.style.display = 'block';
+    }
+    window.addEventListener('resize', fitFullscreen);
+    fitFullscreen();
+
+    FS_BTN.onclick = async () => {
+      try{
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else await document.documentElement.requestFullscreen();
+      } catch(e){console.warn(e)}
+    };
+
+    // We'll load Pyodide and run the Python game code
+    async function main() {
+      const pyodide = await loadPyodide({indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.23.4/full/'});
+      await pyodide.loadPackage(['micropip']);
+      const pythonCode = `
+import math
+import time
+from js import document, requestAnimationFrame, window, console
+
+canvas = document.getElementById('canvas')
+ctx = canvas.getContext('2d')
+
+# Game settings (fixed 2560x1440 logical resolution)
+W, H = 2560, 1440
+CELL = 32  # logical grid cell size (for collision/alignment)
+
+# Smooth snake uses continuous positions in pixels; movement speed in pixels/sec
+SPEED = 420.0  # px/s head speed
+TURN_SPEED = math.pi * 8  # radians/sec turning speed when steering (for smooth steering)
+
+from random import randint, choice
+
+class Vec:
+    def __init__(self,x,y):
+        self.x=float(x); self.y=float(y)
+    def copy(self): return Vec(self.x,self.y)
+    def __add__(self,o): return Vec(self.x+o.x, self.y+o.y)
+    def __sub__(self,o): return Vec(self.x-o.x, self.y-o.y)
+    def mul(self,s): return Vec(self.x*s, self.y*s)
+    def length(self): return math.hypot(self.x,self.y)
+    def norm(self): l=self.length();
+            return self.mul(1/l) if l>0 else Vec(0,0)
+
+# Utility
+
+def to_pixel_grid(v):
+    gx = int((v.x)//CELL)*CELL + CELL//2
+    gy = int((v.y)//CELL)*CELL + CELL//2
+    return Vec(gx,gy)
+
+# Game state
+
+def reset_state():
+    global head, direction, segments, score, food, alive, SPEED
+    head = Vec(W//2, H//2)
+    direction = Vec(1,0)
+    segments = [head.copy()]
+    for i in range(6):
+        segments.append(Vec(head.x - (i+1)*CELL, head.y))
+    score = 0
+    alive = True
+    place_food()
+
+
+def place_food():
+    global food
+    fx = randint(CELL, W-CELL)
+    fy = randint(CELL, H-CELL)
+    food = to_pixel_grid(Vec(fx,fy))
+
+reset_state()
+
+# Input handling
+
+keys = set()
+
+def on_key(e):
+    k = e.key
+    if k in ('ArrowUp','w','W'):
+        keys.add('up')
+    if k in ('ArrowDown','s','S'):
+        keys.add('down')
+    if k in ('ArrowLeft','a','A'):
+        keys.add('left')
+    if k in ('ArrowRight','d','D'):
+        keys.add('right')
+
+def on_key_up(e):
+    k = e.key
+    if k in ('ArrowUp','w','W'):
+        keys.discard('up')
+    if k in ('ArrowDown','s','S'):
+        keys.discard('down')
+    if k in ('ArrowLeft','a','A'):
+        keys.discard('left')
+    if k in ('ArrowRight','d','D'):
+        keys.discard('right')
+
+
+document.addEventListener('keydown', on_key)
+document.addEventListener('keyup', on_key_up)
+
+# Touch controls (simple)
+
+touch_dir = None
+
+def on_touch_start(e):
+    global touch_dir
+    t = e.touches[0]
+    cx = window.innerWidth/2
+    cy = window.innerHeight/2
+    dx = t.clientX - cx
+    dy = t.clientY - cy
+    if abs(dx) > abs(dy): touch_dir = 'right' if dx>0 else 'left'
+    else: touch_dir = 'down' if dy>0 else 'up'
+
+def on_touch_end(e):
+    global touch_dir
+    touch_dir = None
+
+
+document.addEventListener('touchstart', on_touch_start)
+document.addEventListener('touchend', on_touch_end)
+
+# Collision helpers
+
+def check_self_collision():
+    for i,seg in enumerate(segments[6:]):
+        d = (head - seg).length()
+        if d < CELL*0.6:
+            return True
+    return False
+
+# Game loop
+
+last_time = None
+
+def update(ts):
+    global last_time, head, direction, score, alive
+    if last_time is None:
+        last_time = ts
+        requestAnimationFrame(update)
+        return
+    dt = (ts - last_time)/1000.0
+    last_time = ts
+
+    # steering
+    ang = math.atan2(direction.y, direction.x)
+
+    dx = 0; dy = 0
+    if 'left' in keys or (touch_dir=='left'): dx -= 1
+    if 'right' in keys or (touch_dir=='right'): dx += 1
+    if 'up' in keys or (touch_dir=='up'): dy -= 1
+    if 'down' in keys or (touch_dir=='down'): dy += 1
+
+    if dx!=0 or dy!=0:
+        desired_ang = math.atan2(dy, dx)
+    else:
+        desired_ang = ang
+
+    diff = (desired_ang - ang + math.pi) % (2*math.pi) - math.pi
+    max_turn = TURN_SPEED * dt
+    if abs(diff) > max_turn:
+        diff = max_turn * (1 if diff>0 else -1)
+    ang = ang + diff
+    direction = Vec(math.cos(ang), math.sin(ang))
+
+    # speed boost when holding up
+    SPEED_local = SPEED * (1.05 if 'up' in keys else 1.0)
+
+    head.x += direction.x * SPEED_local * dt
+    head.y += direction.y * SPEED_local * dt
+
+    if head.x < 0: head.x += W
+    if head.x > W: head.x -= W
+    if head.y < 0: head.y += H
+    if head.y > H: head.y -= H
+
+    segments.insert(0, head.copy())
+    while len(segments) > 800:
+        segments.pop()
+
+    if (head - food).length() < CELL*0.9:
+        score += 1
+        place_food()
+        for i in range(6):
+            segments.append(segments[-1].copy())
+
+    if check_self_collision():
+        alive = False
+
+    render()
+    if alive:
+        requestAnimationFrame(update)
+    else:
+        game_over()
+
+
+def render():
+    ctx.clearRect(0,0,W,H)
+
+    # subtle grid
+    for gx in range(0, W, CELL*4):
+        ctx.fillStyle = 'rgba(255,255,255,0.01)'
+        ctx.fillRect(gx,0,1,H)
+    for gy in range(0, H, CELL*4):
+        ctx.fillStyle = 'rgba(255,255,255,0.01)'
+        ctx.fillRect(0,gy,W,1)
+
+    # food
+    ctx.beginPath()
+    ctx.fillStyle = 'rgba(255,120,90,0.95)'
+    ctx.arc(food.x, food.y, CELL*0.7, 0, 2*math.pi)
+    ctx.fill()
+    ctx.beginPath()
+    ctx.fillStyle = 'rgba(255,120,90,0.12)'
+    ctx.arc(food.x, food.y, CELL*1.6, 0, 2*math.pi)
+    ctx.fill()
+
+    # snake
+    for i,seg in enumerate(segments[:400]):
+        t = i/ max(1, min(len(segments),400))
+        r = int(20 + 200*(1-t))
+        g = int(80 + 120*(t))
+        b = int(180 - 120*(t))
+        alpha = 0.95 * (1 - t*0.9)
+        ctx.beginPath()
+        ctx.fillStyle = f'rgba({r},{g},{b},{alpha})'
+        size = CELL*0.9 * (1 - 0.4*t)
+        ctx.ellipse(seg.x, seg.y, size, size*0.9, 0, 0, 2*math.pi)
+        ctx.fill()
+
+    ctx.beginPath()
+    ctx.fillStyle = 'rgba(255,255,255,0.9)'
+    ctx.ellipse(head.x, head.y, CELL*0.7, CELL*0.7, 0, 0, 2*math.pi)
+    ctx.fill()
+
+    ctx.fillStyle = 'rgba(255,255,255,0.9)'
+    ctx.font = '42px system-ui'
+    ctx.fillText(f'Score: {score}', 40, 80)
+
+
+def game_over():
+    ctx.fillStyle = 'rgba(0,0,0,0.45)'
+    ctx.fillRect(0,0,W,H)
+    ctx.fillStyle = 'white'
+    ctx.font = '120px system-ui'
+    ctx.fillText('GAME OVER', W/2 - 420, H/2 - 40)
+    ctx.font = '48px system-ui'
+    ctx.fillText(f'Score: {score}', W/2 - 80, H/2 + 50)
+
+requestAnimationFrame(update)
+`
+      ;
+
+      await pyodide.runPythonAsync(pythonCode);
+
+      RESTART_BTN.onclick = () => { window.location.reload(); };
+    }
+
+    main().catch(console.error);
+  </script>
+</body>
+</html>
